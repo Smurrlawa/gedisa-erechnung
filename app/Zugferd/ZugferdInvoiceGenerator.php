@@ -11,6 +11,7 @@ use easybill\eInvoicing\CII\Models\DocumentContextParameter;
 use easybill\eInvoicing\CII\Models\DocumentLineDocument;
 use easybill\eInvoicing\CII\Models\ExchangedDocument;
 use easybill\eInvoicing\CII\Models\ExchangedDocumentContext;
+use easybill\eInvoicing\CII\Models\FormattedDateTime;
 use easybill\eInvoicing\CII\Models\HeaderTradeAgreement;
 use easybill\eInvoicing\CII\Models\HeaderTradeDelivery;
 use easybill\eInvoicing\CII\Models\HeaderTradeSettlement;
@@ -20,6 +21,7 @@ use easybill\eInvoicing\CII\Models\LineTradeDelivery;
 use easybill\eInvoicing\CII\Models\LineTradeSettlement;
 use easybill\eInvoicing\CII\Models\Period;
 use easybill\eInvoicing\CII\Models\Quantity;
+use easybill\eInvoicing\CII\Models\ReferencedDocument;
 use easybill\eInvoicing\CII\Models\SupplyChainEvent;
 use easybill\eInvoicing\CII\Models\SupplyChainTradeLineItem;
 use easybill\eInvoicing\CII\Models\SupplyChainTradeTransaction;
@@ -44,7 +46,9 @@ use easybill\eInvoicing\Enums\ElectronicAddressScheme;
 use easybill\eInvoicing\Enums\UnitCode;
 use easybill\eInvoicing\Transformer;
 use RuntimeException;
+use Stripe\CreditNote as StripeCreditNote;
 use Stripe\Invoice as StripeInvoice;
+use Stripe\StripeObject;
 
 final class ZugferdInvoiceGenerator
 {
@@ -52,23 +56,116 @@ final class ZugferdInvoiceGenerator
 
     private const DATE_FORMAT = 102;
 
-    public function generate(StripeInvoice $invoice): string
+    /**
+     * @param  array<string, float>  $taxRates
+     */
+    public function generate(StripeInvoice $invoice, array $taxRates = []): string
     {
-        $currency = $this->currency($this->str($invoice, 'currency') ?? throw new RuntimeException('Stripe invoice has no currency.'));
-
-        $lineObjects = $this->lineObjects($invoice);
-        if ($lineObjects === []) {
-            throw new RuntimeException('Stripe invoice has no line items.');
+        if ($this->str($invoice, 'status') === 'void') {
+            throw new RuntimeException('Voided Stripe invoices cannot be converted. A cancellation must be issued as a Stripe credit note.');
         }
 
-        $isCreditNote = $this->str($invoice, 'status') === 'void' || ($this->int($invoice, 'total') ?? 0) < 0;
+        return $this->build(
+            source: $invoice,
+            invoice: $invoice,
+            typeCode: DocumentType::COMMERCIAL_INVOICE,
+            number: $this->str($invoice, 'number') ?? $this->str($invoice, 'id')
+                ?? throw new RuntimeException('Stripe invoice has no number/id.'),
+            issueTimestamp: $this->int($invoice, 'status_transitions.finalized_at') ?? $this->int($invoice, 'created'),
+            prepaidMinor: abs($this->int($invoice, 'amount_paid') ?? 0),
+            paymentMeans: $this->paymentMeans($invoice),
+            paymentTerms: $this->paymentTerms($invoice),
+            referencedDocument: null,
+            taxRates: $taxRates,
+        );
+    }
+
+    /**
+     * @param  array<string, float>  $taxRates
+     */
+    public function generateCreditNote(StripeCreditNote $creditNote, array $taxRates = []): string
+    {
+        if ($this->str($creditNote, 'status') === 'void') {
+            throw new RuntimeException('Voided Stripe credit notes cannot be converted.');
+        }
+
+        $invoice = $this->get($creditNote, 'invoice');
+        if (! $invoice instanceof StripeObject || $this->str($invoice, 'object') !== 'invoice') {
+            throw new RuntimeException('Credit note has no expanded invoice to reference.');
+        }
+
+        return $this->build(
+            source: $creditNote,
+            invoice: $invoice,
+            typeCode: DocumentType::CREDIT_NOTE,
+            number: $this->str($creditNote, 'number') ?? throw new RuntimeException('Stripe credit note has no number.'),
+            issueTimestamp: $this->int($creditNote, 'effective_at') ?? $this->int($creditNote, 'created'),
+            prepaidMinor: 0,
+            paymentMeans: null,
+            paymentTerms: $this->creditNotePaymentTerms($creditNote),
+            referencedDocument: $this->referencedInvoice($invoice),
+            taxRates: $taxRates,
+        );
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function taxRateIds(StripeObject $document): array
+    {
+        $entries = [...($this->get($document, 'total_taxes') ?? []), ...($this->get($document, 'total_tax_amounts') ?? [])];
+        foreach ($this->lineObjects($document) as $line) {
+            $entries = [...$entries, ...($this->get($line, 'taxes') ?? []), ...($this->get($line, 'tax_amounts') ?? [])];
+        }
+
+        $ids = [];
+        foreach ($entries as $entry) {
+            $id = $this->str($entry, 'tax_rate_details.tax_rate') ?? $this->str($entry, 'tax_rate');
+            if ($id !== null) {
+                $ids[$id] = $id;
+            }
+        }
+
+        return array_values($ids);
+    }
+
+    /**
+     * @param  array<string, float>  $taxRates
+     */
+    private function build(
+        StripeObject $source,
+        StripeObject $invoice,
+        DocumentType $typeCode,
+        string $number,
+        ?int $issueTimestamp,
+        int $prepaidMinor,
+        ?TradeSettlementPaymentMeans $paymentMeans,
+        ?TradePaymentTerms $paymentTerms,
+        ?ReferencedDocument $referencedDocument,
+        array $taxRates,
+    ): string {
+        $currency = $this->currency($this->str($source, 'currency') ?? throw new RuntimeException('Stripe document has no currency.'));
+        $issueYmd = $this->ymd($issueTimestamp) ?? throw new RuntimeException('Stripe document has no issue date.');
+
+        $lineObjects = $this->lineObjects($source);
+        if ($lineObjects === []) {
+            throw new RuntimeException('Stripe document has no line items.');
+        }
+
+        $fallbackNames = $this->lineDescriptions($invoice);
+        $documentRates = [];
+        foreach ($this->get($source, 'total_taxes') ?? $this->get($source, 'total_tax_amounts') ?? [] as $entry) {
+            $resolved = $this->resolveRate($entry, $taxRates);
+            $documentRates[implode('|', $resolved)] = $resolved;
+        }
+        $documentRates = array_values($documentRates);
 
         $lineItems = [];
         $lineTotalMinor = 0;
         $basisByRate = [];
         $position = 1;
         foreach ($lineObjects as $lineObject) {
-            $line = $this->buildLine($lineObject, (string) $position);
+            $line = $this->buildLine($lineObject, (string) $position, $fallbackNames, $taxRates, $documentRates);
             $lineItems[] = $line['item'];
             $lineTotalMinor += $line['net'];
 
@@ -78,10 +175,10 @@ final class ZugferdInvoiceGenerator
             $position++;
         }
 
-        [$taxNodes, $taxTotalMinor] = $this->buildHeaderTaxes($invoice, $basisByRate);
+        [$taxNodes, $taxTotalMinor] = $this->buildHeaderTaxes($source, $basisByRate, $taxRates);
 
         $grandTotalMinor = $lineTotalMinor + $taxTotalMinor;
-        $stripeTotal = abs($this->int($invoice, 'total') ?? 0);
+        $stripeTotal = abs($this->int($source, 'total') ?? 0);
         if ($grandTotalMinor !== $stripeTotal) {
             throw new RuntimeException(sprintf(
                 'Rounding mismatch: computed grand total %d != Stripe total %d (minor units).',
@@ -90,24 +187,51 @@ final class ZugferdInvoiceGenerator
             ));
         }
 
-        $prepaidMinor = abs($this->int($invoice, 'amount_paid') ?? 0);
-        $documentNumber = $this->str($invoice, 'number') ?? $this->str($invoice, 'id')
-            ?? throw new RuntimeException('Stripe invoice has no number/id.');
+        if ($grandTotalMinor - $prepaidMinor > 0 && $paymentTerms?->dueDate === null && $paymentTerms?->description === null) {
+            throw new RuntimeException('Amount due is positive but neither a due date nor payment terms are available (EN16931 BR-CO-25).');
+        }
+
+        [$periodStart, $periodEnd] = $this->servicePeriod($invoice);
 
         $document = new CrossIndustryInvoice;
         $document->exchangedDocumentContext = $this->context();
-        $document->exchangedDocument = $this->document($invoice, $documentNumber, $isCreditNote);
-        $document->supplyChainTradeTransaction = $this->transaction(
-            $invoice,
-            $documentNumber,
+        $document->exchangedDocument = $this->document($typeCode, $number, $issueYmd);
+
+        $tx = new SupplyChainTradeTransaction;
+        $tx->lineItems = $lineItems;
+
+        $tx->applicableHeaderTradeAgreement = new HeaderTradeAgreement;
+        $tx->applicableHeaderTradeAgreement->sellerTradeParty = $this->seller();
+        $tx->applicableHeaderTradeAgreement->buyerTradeParty = $this->buyer($invoice);
+
+        $tx->applicableHeaderTradeDelivery = new HeaderTradeDelivery;
+        if ($periodEnd !== null) {
+            $tx->applicableHeaderTradeDelivery->chainEvent = $event = new SupplyChainEvent;
+            $event->date = $this->date($periodEnd);
+        }
+
+        $settlement = new HeaderTradeSettlement;
+        $settlement->paymentReference = $number;
+        $settlement->invoiceCurrency = $currency;
+        if ($paymentMeans !== null) {
+            $settlement->specifiedTradeSettlementPaymentMeans[] = $paymentMeans;
+        }
+        $settlement->tradeTaxes = $taxNodes;
+        if ($periodStart !== null && $periodEnd !== null) {
+            $settlement->billingSpecifiedPeriod = $this->period($periodStart, $periodEnd);
+        }
+        $settlement->specifiedTradePaymentTerms = $paymentTerms;
+        $settlement->specifiedTradeSettlementHeaderMonetarySummation = $this->summation(
             $currency,
-            $lineItems,
-            $taxNodes,
             $lineTotalMinor,
             $taxTotalMinor,
             $grandTotalMinor,
             $prepaidMinor,
         );
+        $settlement->invoiceReferencedDocument = $referencedDocument;
+
+        $tx->applicableHeaderTradeSettlement = $settlement;
+        $document->supplyChainTradeTransaction = $tx;
 
         return Transformer::create()->transformToXml($document);
     }
@@ -121,107 +245,28 @@ final class ZugferdInvoiceGenerator
         return $context;
     }
 
-    private function document(StripeInvoice $invoice, string $number, bool $isCreditNote): ExchangedDocument
+    private function document(DocumentType $typeCode, string $number, string $issueYmd): ExchangedDocument
     {
         $document = new ExchangedDocument;
         $document->id = $number;
-        $document->typeCode = $isCreditNote ? DocumentType::CREDIT_NOTE : DocumentType::COMMERCIAL_INVOICE;
-        $document->issueDateTime = $this->date(
-            $this->ymd($this->int($invoice, 'status_transitions.finalized_at') ?? $this->int($invoice, 'created'))
-                ?? throw new RuntimeException('Stripe invoice has no issue date.')
-        );
+        $document->typeCode = $typeCode;
+        $document->issueDateTime = $this->date($issueYmd);
 
         return $document;
     }
 
-    /**
-     * @param  SupplyChainTradeLineItem[]  $lineItems
-     * @param  TradeTax[]  $taxNodes
-     */
-    private function transaction(
-        StripeInvoice $invoice,
-        string $documentNumber,
-        CurrencyCode $currency,
-        array $lineItems,
-        array $taxNodes,
-        int $lineTotalMinor,
-        int $taxTotalMinor,
-        int $grandTotalMinor,
-        int $prepaidMinor,
-    ): SupplyChainTradeTransaction {
-        $tx = new SupplyChainTradeTransaction;
-        $tx->lineItems = $lineItems;
-
-        $tx->applicableHeaderTradeAgreement = new HeaderTradeAgreement;
-        $tx->applicableHeaderTradeAgreement->sellerTradeParty = $this->seller();
-        $tx->applicableHeaderTradeAgreement->buyerTradeParty = $this->buyer($invoice);
-
-        $tx->applicableHeaderTradeDelivery = new HeaderTradeDelivery;
-        [, $deliveryYmd] = $this->servicePeriod($invoice);
-        if ($deliveryYmd !== null) {
-            $tx->applicableHeaderTradeDelivery->chainEvent = $event = new SupplyChainEvent;
-            $event->date = $this->date($deliveryYmd);
-        }
-
-        $tx->applicableHeaderTradeSettlement = $this->settlement(
-            $invoice,
-            $documentNumber,
-            $currency,
-            $taxNodes,
-            $lineTotalMinor,
-            $taxTotalMinor,
-            $grandTotalMinor,
-            $prepaidMinor,
+    private function referencedInvoice(StripeObject $invoice): ReferencedDocument
+    {
+        $reference = ReferencedDocument::create(
+            $this->str($invoice, 'number') ?? throw new RuntimeException('Referenced invoice has no number.')
         );
 
-        return $tx;
-    }
-
-    /**
-     * @param  TradeTax[]  $taxNodes
-     */
-    private function settlement(
-        StripeInvoice $invoice,
-        string $documentNumber,
-        CurrencyCode $currency,
-        array $taxNodes,
-        int $lineTotalMinor,
-        int $taxTotalMinor,
-        int $grandTotalMinor,
-        int $prepaidMinor,
-    ): HeaderTradeSettlement {
-        $settlement = new HeaderTradeSettlement;
-        $settlement->paymentReference = $documentNumber;
-        $settlement->invoiceCurrency = $currency;
-        $settlement->specifiedTradeSettlementPaymentMeans[] = $this->paymentMeans($invoice);
-        $settlement->tradeTaxes = $taxNodes;
-
-        [$periodStart, $periodEnd] = $this->servicePeriod($invoice);
-        if ($periodStart !== null && $periodEnd !== null) {
-            $settlement->billingSpecifiedPeriod = $this->period($periodStart, $periodEnd);
+        $issuedYmd = $this->ymd($this->int($invoice, 'status_transitions.finalized_at') ?? $this->int($invoice, 'created'));
+        if ($issuedYmd !== null) {
+            $reference->formattedIssueDateTime = FormattedDateTime::create(self::DATE_FORMAT, $issuedYmd);
         }
 
-        $dueDateYmd = $this->ymd($this->int($invoice, 'due_date'));
-        $mandate = $this->mandateReference($invoice);
-        if ($dueDateYmd !== null || $mandate !== null) {
-            $settlement->specifiedTradePaymentTerms = $terms = new TradePaymentTerms;
-            if ($dueDateYmd !== null) {
-                $terms->dueDate = $this->date($dueDateYmd);
-            }
-            if ($mandate !== null) {
-                $terms->directDebitMandateID = $mandate;
-            }
-        }
-
-        $settlement->specifiedTradeSettlementHeaderMonetarySummation = $this->summation(
-            $currency,
-            $lineTotalMinor,
-            $taxTotalMinor,
-            $grandTotalMinor,
-            $prepaidMinor,
-        );
-
-        return $settlement;
+        return $reference;
     }
 
     private function summation(
@@ -245,26 +290,40 @@ final class ZugferdInvoiceGenerator
     }
 
     /**
+     * @param  array<string, string>  $fallbackNames
+     * @param  array<string, float>  $taxRates
+     * @param  list<array{0: string, 1: string}>  $documentRates
      * @return array{item: SupplyChainTradeLineItem, net: int, category: string, rate: string}
      */
-    private function buildLine(object $line, string $position): array
+    private function buildLine(object $line, string $position, array $fallbackNames, array $taxRates, array $documentRates): array
     {
         $name = $this->str($line, 'description');
         if ($name === null || $name === '') {
-            throw new RuntimeException("Missing description on invoice line {$position}.");
+            $name = $fallbackNames[$this->str($line, 'invoice_line_item') ?? ''] ?? null;
+        }
+        if ($name === null || $name === '') {
+            throw new RuntimeException("Missing description on line {$position}.");
         }
 
         $quantity = $this->int($line, 'quantity') ?? 1;
 
         $grossMinor = abs($this->int($line, 'subtotal')
             ?? $this->int($line, 'amount')
-            ?? throw new RuntimeException("Missing amount on invoice line {$position}."));
+            ?? throw new RuntimeException("Missing amount on line {$position}."));
 
         $unitMinor = abs($this->decimalMinor($this->str($line, 'pricing.unit_amount_decimal'))
+            ?? $this->decimalMinor($this->str($line, 'unit_amount_decimal'))
             ?? $this->int($line, 'price.unit_amount')
+            ?? $this->int($line, 'unit_amount')
             ?? ($quantity !== 0 ? intdiv($grossMinor, $quantity) : $grossMinor));
 
-        [$category, $rate] = $this->resolveRate(($this->get($line, 'taxes') ?? $this->get($line, 'tax_amounts') ?? [])[0] ?? null);
+        $lineTax = ($this->get($line, 'taxes') ?? $this->get($line, 'tax_amounts') ?? [])[0] ?? null;
+        [$category, $rate] = match (true) {
+            $lineTax !== null => $this->resolveRate($lineTax, $taxRates),
+            count($documentRates) === 1 => $documentRates[0],
+            $documentRates === [] => ['Z', '0'],
+            default => throw new RuntimeException("Cannot determine tax rate for line {$position}: no line tax and multiple document rates."),
+        };
 
         $item = new SupplyChainTradeLineItem;
         $item->associatedDocumentLineDocument = DocumentLineDocument::create($position);
@@ -315,16 +374,17 @@ final class ZugferdInvoiceGenerator
 
     /**
      * @param  array<string, array{category: string, rate: string, basis: int}>  $basisByRate
+     * @param  array<string, float>  $taxRates
      * @return array{0: TradeTax[], 1: int}
      */
-    private function buildHeaderTaxes(StripeInvoice $invoice, array $basisByRate): array
+    private function buildHeaderTaxes(StripeObject $source, array $basisByRate, array $taxRates): array
     {
         $nodes = [];
         $taxTotalMinor = 0;
 
-        $breakdown = $this->get($invoice, 'total_taxes') ?? $this->get($invoice, 'total_tax_amounts') ?? [];
+        $breakdown = $this->get($source, 'total_taxes') ?? $this->get($source, 'total_tax_amounts') ?? [];
         foreach ($breakdown as $entry) {
-            [$category, $rate] = $this->resolveRate($entry);
+            [$category, $rate] = $this->resolveRate($entry, $taxRates);
             $basis = abs($this->int($entry, 'taxable_amount') ?? 0);
             $calculated = abs($this->int($entry, 'amount') ?? 0);
             $taxTotalMinor += $calculated;
@@ -396,7 +456,7 @@ final class ZugferdInvoiceGenerator
         return $party;
     }
 
-    private function buyer(StripeInvoice $invoice): TradeParty
+    private function buyer(StripeObject $invoice): TradeParty
     {
         $address = $this->get($invoice, 'customer_address') ?? $this->get($invoice, 'customer.address');
 
@@ -471,14 +531,68 @@ final class ZugferdInvoiceGenerator
         return $means;
     }
 
-    private function mandateReference(StripeInvoice $invoice): ?string
+    private function paymentTerms(StripeInvoice $invoice): ?TradePaymentTerms
     {
-        if ($this->str($invoice, 'payment_intent.payment_method.type') !== 'sepa_debit') {
+        $dueDateYmd = $this->ymd($this->int($invoice, 'due_date'));
+        $mandate = $this->str($invoice, 'payment_intent.payment_method.type') === 'sepa_debit'
+            ? $this->str($invoice, 'payment_intent.payment_method.sepa_debit.mandate') ?? $this->str($invoice, 'payment_intent.mandate')
+            : null;
+
+        $description = null;
+        if ($dueDateYmd === null
+            && ($this->int($invoice, 'amount_remaining') ?? 0) > 0
+            && $this->str($invoice, 'collection_method') === 'charge_automatically') {
+            $methodTypes = $this->get($invoice, 'payment_settings.payment_method_types');
+            $description = is_array($methodTypes) && $methodTypes === ['sepa_debit']
+                ? 'Der Rechnungsbetrag wird per SEPA-Lastschrift von Ihrem Konto eingezogen.'
+                : 'Der Rechnungsbetrag wird automatisch über die hinterlegte Zahlungsmethode eingezogen.';
+        }
+
+        if ($dueDateYmd === null && $mandate === null && $description === null) {
             return null;
         }
 
-        return $this->str($invoice, 'payment_intent.payment_method.sepa_debit.mandate')
-            ?? $this->str($invoice, 'payment_intent.mandate');
+        $terms = new TradePaymentTerms;
+        $terms->description = $description;
+        if ($dueDateYmd !== null) {
+            $terms->dueDate = $this->date($dueDateYmd);
+        }
+        if ($mandate !== null) {
+            $terms->directDebitMandateID = $mandate;
+        }
+
+        return $terms;
+    }
+
+    private function creditNotePaymentTerms(StripeCreditNote $creditNote): ?TradePaymentTerms
+    {
+        $refundedMinor = 0;
+        foreach ($this->get($creditNote, 'refunds') ?? [] as $refund) {
+            $refundedMinor += abs($this->int($refund, 'amount_refunded') ?? 0);
+        }
+
+        $parts = [];
+        if ($refundedMinor > 0) {
+            $parts[] = 'Der Betrag wird auf die ursprüngliche Zahlungsmethode erstattet.';
+        }
+        if ($this->get($creditNote, 'customer_balance_transaction') !== null) {
+            $parts[] = 'Der Betrag wird Ihrem Kundenguthaben gutgeschrieben.';
+        }
+        if (($this->int($creditNote, 'out_of_band_amount') ?? 0) > 0) {
+            $parts[] = 'Der Betrag wurde außerhalb von Stripe ausgeglichen.';
+        }
+        if (($this->int($creditNote, 'pre_payment_amount') ?? 0) > 0) {
+            $parts[] = 'Der Betrag wird mit der offenen Rechnung verrechnet.';
+        }
+
+        if ($parts === []) {
+            return null;
+        }
+
+        $terms = new TradePaymentTerms;
+        $terms->description = implode(' ', $parts);
+
+        return $terms;
     }
 
     private function emailEndpoint(string $email): UniversalCommunication
@@ -517,19 +631,17 @@ final class ZugferdInvoiceGenerator
     }
 
     /**
+     * @param  array<string, float>  $taxRates
      * @return array{0: string, 1: string}
      */
-    private function resolveRate(mixed $tax): array
+    private function resolveRate(mixed $tax, array $taxRates): array
     {
-        if ($tax === null) {
-            return ['Z', '0'];
-        }
+        $rateId = $this->str($tax, 'tax_rate_details.tax_rate') ?? $this->str($tax, 'tax_rate');
 
-        $percent = $this->get($tax, 'tax_rate.percentage') ?? $this->get($tax, 'rate.percentage');
-        if ($percent === null) {
-            $base = abs($this->int($tax, 'taxable_amount') ?? 0);
-            $percent = $base === 0 ? 0.0 : abs($this->int($tax, 'amount') ?? 0) / $base * 100;
-        }
+        $percent = $this->get($tax, 'tax_rate.percentage')
+            ?? $this->get($tax, 'rate.percentage')
+            ?? ($rateId !== null ? $taxRates[$rateId] ?? null : null)
+            ?? throw new RuntimeException('Tax rate could not be determined'.($rateId !== null ? " for '{$rateId}'." : '.'));
 
         $formatted = number_format((float) $percent, 2, '.', '');
         $rate = str_contains($formatted, '.') ? rtrim(rtrim($formatted, '0'), '.') : $formatted;
@@ -545,7 +657,7 @@ final class ZugferdInvoiceGenerator
     /**
      * @return array{0: ?string, 1: ?string}
      */
-    private function servicePeriod(StripeInvoice $invoice): array
+    private function servicePeriod(StripeObject $invoice): array
     {
         $start = null;
         $end = null;
@@ -561,6 +673,23 @@ final class ZugferdInvoiceGenerator
         }
 
         return [$start, $end];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    private function lineDescriptions(StripeObject $invoice): array
+    {
+        $names = [];
+        foreach ($this->lineObjects($invoice) as $line) {
+            $id = $this->str($line, 'id');
+            $description = $this->str($line, 'description');
+            if ($id !== null && $description !== null) {
+                $names[$id] = $description;
+            }
+        }
+
+        return $names;
     }
 
     private function money(int $minor): string
@@ -584,9 +713,9 @@ final class ZugferdInvoiceGenerator
     /**
      * @return list<object>
      */
-    private function lineObjects(StripeInvoice $invoice): array
+    private function lineObjects(StripeObject $document): array
     {
-        $lines = $this->get($invoice, 'lines.data') ?? [];
+        $lines = $this->get($document, 'lines.data') ?? [];
 
         return is_array($lines) ? array_values($lines) : iterator_to_array($lines);
     }
@@ -607,7 +736,7 @@ final class ZugferdInvoiceGenerator
     {
         $value = $this->get($object, $path);
 
-        return $value === null ? null : (string) $value;
+        return is_scalar($value) ? (string) $value : null;
     }
 
     private function int(mixed $object, string $path): ?int

@@ -10,7 +10,7 @@ use Throwable;
 
 final class GenerateZugferdXmlCommand extends Command
 {
-    protected $signature = 'zugferd:generate {invoice : Stripe Invoice ID} {--out= : Optionaler Dateipfad für das XML}';
+    protected $signature = 'zugferd:generate {invoice : Stripe Invoice ID (in_...) oder Credit Note ID (cn_...)} {--out= : Optionaler Dateipfad für das XML}';
 
     protected $description = 'TEMP: Erzeugt ZUGFeRD-XML aus einer Stripe Invoice ID';
 
